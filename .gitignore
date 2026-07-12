@@ -13,3 +13,6 @@ dist
 # Clawnify deploy state (contains app_token) — never commit
 .clawnify
 .clawnify/
+
+# Internal design-system guidance for the builder/agent — never published
+DESIGN.md

@@ -57,11 +57,12 @@ app.get("/api/compositions/:id", async (c) => {
 app.post("/api/compositions", async (c) => {
   const b = await c.req.json<Partial<Composition>>();
   if (!b.name?.trim()) return c.json({ error: "name is required" }, 400);
-  const res = await run(
-    "INSERT INTO compositions (name, description, html, fps) VALUES (?, ?, ?, ?)",
-    [b.name.trim(), b.description ?? "", b.html ?? "", b.fps ?? 30],
+  const id = crypto.randomUUID();
+  await run(
+    "INSERT INTO compositions (id, name, description, html, fps) VALUES (?, ?, ?, ?, ?)",
+    [id, b.name.trim(), b.description ?? "", b.html ?? "", b.fps ?? 30],
   );
-  const row = await get<Composition>("SELECT * FROM compositions WHERE rowid = ?", [res.lastInsertRowid]);
+  const row = await get<Composition>("SELECT * FROM compositions WHERE id = ?", [id]);
   return c.json(row, 201);
 });
 
@@ -273,7 +274,11 @@ function previewDoc(html: string): string {
         var w = +(root.dataset.width || 1920), h = +(root.dataset.height || 1080);
         root.style.width = w + 'px'; root.style.height = h + 'px';
         root.style.position = 'relative'; root.style.transformOrigin = 'top left';
-        var fit = function () { var s = Math.min(innerWidth / w, innerHeight / h); root.style.transform = 'scale(' + s + ')'; };
+        var fit = function () {
+          var s = Math.min(innerWidth / w, innerHeight / h);
+          var tx = (innerWidth - w * s) / 2, ty = (innerHeight - h * s) / 2;
+          root.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + s + ')';
+        };
         fit(); addEventListener('resize', fit);
       }
       tls = Object.values(window.__timelines || {});
