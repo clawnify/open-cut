@@ -2,7 +2,16 @@
 -- width/height/duration live in the HTML's data-* attributes; we only keep the
 -- render-time knobs the CLI needs (fps).
 CREATE TABLE IF NOT EXISTS compositions (
-  id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+  -- UUIDv4. The API supplies crypto.randomUUID(); this default covers any
+  -- direct insert so the primary key (and the URL it appears in) is always a UUID.
+  id TEXT PRIMARY KEY DEFAULT (
+    lower(hex(randomblob(4))) || '-' ||
+    lower(hex(randomblob(2))) || '-4' ||
+    substr(lower(hex(randomblob(2))), 2) || '-' ||
+    substr('89ab', abs(random()) % 4 + 1, 1) ||
+    substr(lower(hex(randomblob(2))), 2) || '-' ||
+    lower(hex(randomblob(6)))
+  ),
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   html TEXT NOT NULL DEFAULT '',
