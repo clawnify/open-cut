@@ -1,5 +1,5 @@
-import { Hono } from "hono";
-import { initDB, query, get, run } from "./db";
+import { createApp } from "@clawnify/app";
+import { query, get, run } from "./db";
 import {
   initUploads,
   putUpload,
@@ -18,10 +18,14 @@ type Bindings = {
   SERVICES_URL?: string;
 };
 
-const app = new Hono<{ Bindings: Bindings }>();
+const app = createApp<{ Bindings: Bindings }>({
+  title: "Open Video Editor",
+  version: "1.0.0",
+  description:
+    "Open-source, agent-friendly video editor. Compose videos as plain HTML on a timeline, drop in your own media, preview with a scrubbable playhead, and render to MP4.",
+});
 
 app.use("/api/*", async (c, next) => {
-  initDB(c.env);
   initUploads(c.env.UPLOADS);
   await next();
 });
