@@ -1,8 +1,8 @@
-<img src="readme-banner.png" alt="Open Video Editor preview" width="100%" />
+<img src="readme-banner.png" alt="Open Cut preview" width="100%" />
 
-# Open Video Editor
+# Open Cut
 
-[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-video-editor)
+[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-cut)
 
 An open-source, **agent-friendly video editor**. Compose videos as plain **HTML on a timeline**, drop in your own media (logos, product demos), preview with a scrubbable playhead, and render to **MP4**.
 

@@ -1,4 +1,4 @@
-name = "open-video-editor"
+name = "open-cut"
 main = "src/server/index.ts"
 compatibility_date = "2026-04-15"
 compatibility_flags = ["nodejs_compat"]
@@ -14,9 +14,9 @@ run_worker_first = ["/api/*"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "open-video-editor-db"
+database_name = "open-cut-db"
 database_id = "local"
 
 [[r2_buckets]]
 binding = "UPLOADS"
-bucket_name = "open-video-editor-uploads"
+bucket_name = "open-cut-uploads"

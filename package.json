@@ -1,10 +1,10 @@
 {
-  "name": "@clawnify/open-video-editor",
+  "name": "@clawnify/open-cut",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler d1 execute open-video-editor-db --local --file=src/server/schema.sql && concurrently -n ui,api -c cyan,green \"vite\" \"wrangler dev --port 8787\"",
+    "dev": "wrangler d1 execute open-cut-db --local --file=src/server/schema.sql && concurrently -n ui,api -c cyan,green \"vite\" \"wrangler dev --port 8787\"",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "deploy": "clawnify deploy"
