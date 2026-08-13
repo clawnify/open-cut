@@ -176,6 +176,63 @@ export interface AnalyzeResult {
   notes: string;
 }
 
+// The editorial framing — what to ask and the answer's shape — is THIS app's
+// concern; the platform's analysis endpoint is a generic "your prompt, your
+// schema" primitive over staged footage.
+const ANALYSIS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["cuts", "captions", "notes"],
+  properties: {
+    cuts: {
+      type: "array",
+      description: "Segments of the footage in playback order",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["start_ms", "end_ms", "label", "keep"],
+        properties: {
+          start_ms: { type: "integer" },
+          end_ms: { type: "integer" },
+          label: { type: "string", description: "what happens in this segment" },
+          keep: { type: "boolean", description: "true = recommended for the cut" },
+        },
+      },
+    },
+    captions: {
+      type: "array",
+      description: "Short on-screen caption lines with timing",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["start_ms", "end_ms", "text"],
+        properties: {
+          start_ms: { type: "integer" },
+          end_ms: { type: "integer" },
+          text: { type: "string" },
+        },
+      },
+    },
+    notes: { type: "string", description: "one short paragraph of editorial observations" },
+  },
+};
+
+function analysisPrompt(mode: string, brief?: string): string {
+  const wants =
+    mode === "cuts"
+      ? "Propose cuts only; return an empty captions array."
+      : mode === "captions"
+        ? "Propose captions only; return an empty cuts array."
+        : "Propose both cuts and captions.";
+  return (
+    "You are a video editor's assistant. Watch the video and propose an edit. " +
+    "Cuts: the segments worth keeping, in playback order, with millisecond start/end timestamps " +
+    "(tight in-points and out-points — trim dead air, false starts and filler). " +
+    "Captions: short on-screen lines matching the spoken content, with millisecond timing. " +
+    `${wants}${brief ? ` Editor's brief: ${brief}` : ""}`
+  );
+}
+
 /**
  * Ask the managed analysis service to watch one library asset and propose
  * cuts + captions (millisecond timestamps). Stages the asset first if needed.
@@ -188,15 +245,21 @@ export async function analyzeAsset(
   const staged = await ensureStagedSrc(assetId, cfg);
   if ("failure" in staged) return staged;
 
+  const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
   const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/analyze`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ src: staged.src, mode: opts.mode, prompt: opts.prompt }),
+    body: JSON.stringify({
+      src: staged.src,
+      prompt: analysisPrompt(mode, opts.prompt),
+      schema: ANALYSIS_SCHEMA,
+      schema_name: "edit_analysis",
+    }),
   });
   const json = (await res.json().catch(() => null)) as
-    | (Partial<AnalyzeResult> & { error?: string; detail?: string })
+    | { model?: string; output?: Partial<AnalyzeResult>; error?: string; detail?: string }
     | null;
-  if (res.status !== 200 || !Array.isArray(json?.cuts)) {
+  if (res.status !== 200 || !Array.isArray(json?.output?.cuts)) {
     return {
       failure: {
         error: json?.error ?? "analyze_failed",
@@ -204,7 +267,7 @@ export async function analyzeAsset(
       },
     };
   }
-  return { result: json as AnalyzeResult };
+  return { result: { ...(json.output as AnalyzeResult), model: json.model ?? "" } };
 }
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */
