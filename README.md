@@ -18,7 +18,8 @@ Most programmatic video tools lock you into a component framework or a paid lice
 - **Live preview** — see the composition animate as you edit; one master clock keeps the preview and the timeline in sync.
 - **Bring your own media** — upload logos and product-demo clips and reference them by path (`assets/your-logo.png`) right in the HTML.
 - **One-click render** — produces a real MP4, stored and played back in the gallery.
-- **Agent-ready** — a clean REST API (`/api/compositions`, `/api/assets`, `/api/renders`) and an `agent.md` so an AI agent can author and render videos without a human in the loop.
+- **Footage editing (EDL)** — cut, trim and sequence real uploaded clips, overlay images and text, and mix music under the cut. The edit is a plain-JSON **edit decision list**: the main track is an ordered array of clips (splicing is an array insert), times are seconds, positions are canvas fractions. Exports run on Clawnify's managed edit service and come back as MP4s.
+- **Agent-ready** — a clean REST API (`/api/compositions`, `/api/assets`, `/api/renders`, `/api/projects`, `/api/exports`) and an `agent.md` so an AI agent can author, edit and render videos without a human in the loop. Validation errors carry a JSON pointer to the offending node, so an agent's edit loop self-corrects.
 
 ## How a composition works
 
@@ -66,8 +67,8 @@ Rendering runs on Clawnify's managed render service, so deployed instances need 
 ```
 src/
   client/app.tsx     # editor UI: compositions, timeline, media, renders
-  server/            # REST API (compositions, assets, renders) + preview
-agent.md             # how an AI agent authors and renders videos
+  server/            # REST API (compositions, assets, renders, edit projects, exports)
+agent.md             # how an AI agent authors, edits and renders videos
 ```
 
 ## License

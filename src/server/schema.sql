@@ -28,7 +28,12 @@ CREATE TABLE IF NOT EXISTS assets (
   name TEXT NOT NULL,
   content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
   size INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  -- Edit-service staging pointer: uploaded once, reused by every export.
+  -- Staged copies expire (~30 days); exports re-stage transparently when the
+  -- pointer is missing or stale, so this is a cache, not a source of truth.
+  service_key TEXT,
+  service_key_expires_at TEXT
 );
 
 -- Render jobs: one row per render. The MP4 is stored in R2 and served from
@@ -44,3 +49,37 @@ CREATE TABLE IF NOT EXISTS render_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_render_jobs_composition ON render_jobs(composition_id);
+
+-- Footage edit projects: the EDL (edit decision list) JSON is the document.
+-- Clips reference media-library assets as "asset:<id>"; exports resolve them
+-- to staged sources and run on the managed edit service.
+CREATE TABLE IF NOT EXISTS edit_projects (
+  id TEXT PRIMARY KEY DEFAULT (
+    lower(hex(randomblob(4))) || '-' ||
+    lower(hex(randomblob(2))) || '-4' ||
+    substr(lower(hex(randomblob(2))), 2) || '-' ||
+    substr('89ab', abs(random()) % 4 + 1, 1) ||
+    substr(lower(hex(randomblob(2))), 2) || '-' ||
+    lower(hex(randomblob(6)))
+  ),
+  name TEXT NOT NULL,
+  edl TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Export jobs: one row per export of an edit project. The MP4 is copied into
+-- this app's storage and served from output_url. status: exporting | completed | failed.
+CREATE TABLE IF NOT EXISTS export_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'exporting',
+  output_url TEXT,
+  error TEXT,
+  duration REAL,
+  size INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_jobs_project ON export_jobs(project_id);

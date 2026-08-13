@@ -8,6 +8,8 @@ import {
   makeKey,
 } from "./uploads";
 import { renderComposition } from "./render";
+import { starterEdl, validateEdl, type Edl } from "./edl";
+import { copyOutput, resolveEdlSources, runEdit } from "./export";
 
 type Bindings = {
   DB: D1Database;
@@ -219,6 +221,181 @@ app.post("/api/renders", async (c) => {
   }
 
   const job = await get<RenderJob>("SELECT * FROM render_jobs WHERE id = ?", [jobId]);
+  return c.json(job, 201);
+});
+
+// ── Edit projects (footage EDL) ──────────────────────────────────────
+// A project's document is an EDL: real footage cut/trimmed/sequenced on a
+// main track, with overlay and audio tracks. See agent.md for the format.
+
+interface EditProject {
+  id: string;
+  name: string;
+  edl: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ExportJob {
+  id: number;
+  project_id: string;
+  status: string;
+  output_url: string | null;
+  error: string | null;
+  duration: number | null;
+  size: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Project row with the EDL parsed for the response. */
+function projectOut(row: EditProject) {
+  return { ...row, edl: JSON.parse(row.edl) as Edl };
+}
+
+app.get("/api/projects", async (c) => {
+  const rows = await query<Omit<EditProject, "edl">>(
+    "SELECT id, name, created_at, updated_at FROM edit_projects ORDER BY updated_at DESC",
+  );
+  return c.json(rows);
+});
+
+app.get("/api/projects/:id", async (c) => {
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(projectOut(row));
+});
+
+app.post("/api/projects", async (c) => {
+  const b = await c.req.json<{ name?: string; edl?: unknown }>();
+  if (!b.name?.trim()) return c.json({ error: "name is required" }, 400);
+
+  let edl: Edl;
+  if (b.edl !== undefined) {
+    const v = validateEdl(b.edl);
+    if ("invalid" in v) return c.json(v.invalid, 422);
+    edl = v.edl;
+  } else {
+    edl = starterEdl();
+  }
+
+  const id = crypto.randomUUID();
+  await run("INSERT INTO edit_projects (id, name, edl) VALUES (?, ?, ?)", [
+    id,
+    b.name.trim(),
+    JSON.stringify(edl),
+  ]);
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  return c.json(projectOut(row!), 201);
+});
+
+app.put("/api/projects/:id", async (c) => {
+  const id = c.req.param("id");
+  const existing = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
+  const b = await c.req.json<{ name?: string; edl?: unknown }>();
+  let edlJson = existing.edl;
+  if (b.edl !== undefined) {
+    const v = validateEdl(b.edl);
+    if ("invalid" in v) return c.json(v.invalid, 422);
+    edlJson = JSON.stringify(v.edl);
+  }
+  await run(
+    "UPDATE edit_projects SET name = ?, edl = ?, updated_at = datetime('now') WHERE id = ?",
+    [b.name?.trim() || existing.name, edlJson, id],
+  );
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  return c.json(projectOut(row!));
+});
+
+app.delete("/api/projects/:id", async (c) => {
+  const id = c.req.param("id");
+  await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
+  await run("DELETE FROM edit_projects WHERE id = ?", [id]);
+  return c.json({ ok: true });
+});
+
+// ── Exports ──────────────────────────────────────────────────────────
+
+app.get("/api/exports", async (c) => {
+  const projectId = c.req.query("project_id");
+  const rows = projectId
+    ? await query<ExportJob>(
+        "SELECT * FROM export_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 50",
+        [projectId],
+      )
+    : await query<ExportJob>("SELECT * FROM export_jobs ORDER BY created_at DESC LIMIT 50");
+  return c.json(rows);
+});
+
+app.get("/api/exports/:id", async (c) => {
+  const row = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(row);
+});
+
+app.post("/api/projects/:id/export", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [
+    c.req.param("id"),
+  ]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json(
+      { error: "Edit service not configured (missing CLAWNIFY_TOKEN). Exports run on deployed apps." },
+      503,
+    );
+  }
+
+  const parsed = validateEdl(JSON.parse(project.edl));
+  if ("invalid" in parsed) return c.json(parsed.invalid, 422);
+  if (parsed.edl.main.elements.length === 0) {
+    return c.json(
+      { error: "edl_invalid", detail: "the main track is empty — add clips before exporting", path: "/main/elements" },
+      422,
+    );
+  }
+
+  const b = (await c.req.json<{ quality?: string }>().catch(() => ({}))) as { quality?: string };
+  const quality = ["draft", "standard", "high"].includes(b.quality ?? "") ? b.quality! : "standard";
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+
+  const res = await run("INSERT INTO export_jobs (project_id, status) VALUES (?, 'exporting')", [
+    project.id,
+  ]);
+  const jobId = res.lastInsertRowid as number;
+  const fail = async (error: string, detail: string, path?: string) => {
+    const msg = `${error}: ${detail}${path ? ` (at ${path})` : ""}`.slice(0, 1000);
+    await run("UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?", [msg, jobId]);
+    const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
+    // Machine-readable failure alongside the job row, so an editing loop can
+    // jump straight to the offending EDL node.
+    return c.json({ ...job, failure: { error, detail, ...(path ? { path } : {}) } }, 201);
+  };
+
+  try {
+    const resolved = await resolveEdlSources(parsed.edl, cfg);
+    if ("failure" in resolved) return fail(resolved.failure.error, resolved.failure.detail, resolved.failure.path);
+
+    const edited = await runEdit(
+      resolved.edl,
+      { quality, filename: `${makeKey(project.name)}.mp4` },
+      cfg,
+    );
+    if ("failure" in edited) return fail(edited.failure.error, edited.failure.detail, edited.failure.path);
+
+    const key = `renders/edit-${jobId}-${lower8()}.mp4`;
+    await copyOutput(edited.result, key);
+    await run(
+      "UPDATE export_jobs SET status = 'completed', output_url = ?, duration = ?, size = ?, updated_at = datetime('now') WHERE id = ?",
+      [`/api/uploads/${encodeURIComponent(key)}`, edited.result.duration, edited.result.size, jobId],
+    );
+  } catch (err) {
+    return fail("export_failed", String(err).slice(0, 500));
+  }
+
+  const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
   return c.json(job, 201);
 });
 
