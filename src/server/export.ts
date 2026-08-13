@@ -38,6 +38,39 @@ export interface ExportFailure {
 }
 
 /**
+ * Ensure one media-library asset has a fresh staged copy on the edit service;
+ * returns its "file:…" src. Used by exports (every referenced asset) and by
+ * footage analysis (one asset at a time).
+ */
+export async function ensureStagedSrc(
+  assetId: string,
+  cfg: ExportConfig,
+): Promise<{ src: string } | { failure: ExportFailure }> {
+  const asset = await get<AssetRow>("SELECT * FROM assets WHERE id = ?", [assetId]);
+  if (!asset) {
+    return {
+      failure: {
+        error: "asset_not_found",
+        detail: `no media-library asset with id "${assetId}" — list assets with GET /api/assets`,
+      },
+    };
+  }
+
+  const fresh =
+    asset.service_key &&
+    asset.service_key_expires_at &&
+    Date.parse(asset.service_key_expires_at) > Date.now() + RESTAGE_MARGIN_MS;
+
+  let key = asset.service_key;
+  if (!fresh) {
+    const stagedFile = await stageAsset(asset, cfg);
+    if ("failure" in stagedFile) return stagedFile;
+    key = stagedFile.key;
+  }
+  return { src: `file:${key}` };
+}
+
+/**
  * Resolve every "asset:<id>" in the EDL to a fresh staged source, re-staging
  * from this app's storage where needed. Returns the resolved document or a
  * failure the caller can surface directly.
@@ -47,32 +80,11 @@ export async function resolveEdlSources(
   cfg: ExportConfig,
 ): Promise<{ edl: Edl } | { failure: ExportFailure }> {
   const staged = new Map<string, string>();
-
   for (const assetId of collectAssetIds(edl)) {
-    const asset = await get<AssetRow>("SELECT * FROM assets WHERE id = ?", [assetId]);
-    if (!asset) {
-      return {
-        failure: {
-          error: "asset_not_found",
-          detail: `no media-library asset with id "${assetId}" — list assets with GET /api/assets`,
-        },
-      };
-    }
-
-    const fresh =
-      asset.service_key &&
-      asset.service_key_expires_at &&
-      Date.parse(asset.service_key_expires_at) > Date.now() + RESTAGE_MARGIN_MS;
-
-    let key = asset.service_key;
-    if (!fresh) {
-      const stagedFile = await stageAsset(asset, cfg);
-      if ("failure" in stagedFile) return stagedFile;
-      key = stagedFile.key;
-    }
-    staged.set(assetId, `file:${key}`);
+    const res = await ensureStagedSrc(assetId, cfg);
+    if ("failure" in res) return res;
+    staged.set(assetId, res.src);
   }
-
   return { edl: substituteAssetSrcs(edl, (id) => staged.get(id)!) };
 }
 
@@ -155,6 +167,44 @@ export async function runEdit(
     };
   }
   return { result: { url: json.url, duration: json.duration ?? 0, size: json.size ?? 0 } };
+}
+
+export interface AnalyzeResult {
+  model: string;
+  cuts: { start_ms: number; end_ms: number; label: string; keep: boolean }[];
+  captions: { start_ms: number; end_ms: number; text: string }[];
+  notes: string;
+}
+
+/**
+ * Ask the managed analysis service to watch one library asset and propose
+ * cuts + captions (millisecond timestamps). Stages the asset first if needed.
+ */
+export async function analyzeAsset(
+  assetId: string,
+  opts: { mode?: string; prompt?: string },
+  cfg: ExportConfig,
+): Promise<{ result: AnalyzeResult } | { failure: ExportFailure }> {
+  const staged = await ensureStagedSrc(assetId, cfg);
+  if ("failure" in staged) return staged;
+
+  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/analyze`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ src: staged.src, mode: opts.mode, prompt: opts.prompt }),
+  });
+  const json = (await res.json().catch(() => null)) as
+    | (Partial<AnalyzeResult> & { error?: string; detail?: string })
+    | null;
+  if (res.status !== 200 || !Array.isArray(json?.cuts)) {
+    return {
+      failure: {
+        error: json?.error ?? "analyze_failed",
+        detail: json?.detail ?? `analysis service returned ${res.status}`,
+      },
+    };
+  }
+  return { result: json as AnalyzeResult };
 }
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */

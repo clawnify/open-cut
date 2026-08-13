@@ -69,6 +69,7 @@ also upload programmatically with a multipart `POST /api/assets`.)
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
 | GET  | `/api/exports?project_id={id}` | Export history |
+| POST | `/api/assets/{id}/analyze` | AI cut/caption proposals for a clip (ms timestamps) |
 
 ## Footage edit projects (EDL)
 
@@ -166,6 +167,44 @@ index 1 of `main.elements` (nothing else changes — no start-time math):
   "startTime": 44, "duration": 4, "x": 0.5, "y": 0.45, "align": "center",
   "color": "#ffffff", "background": "#000000aa" }
 ```
+
+### Analyzing footage (AI cut proposals)
+
+Before editing a long or unfamiliar clip, ask for an analysis:
+
+```
+POST /api/assets/{id}/analyze
+{ "mode": "cuts" | "captions" | "both", "prompt": "optional brief, e.g. keep only the demo moments" }
+```
+
+A multimodal model watches the clip and returns, in a few seconds:
+
+```json
+{
+  "cuts": [
+    { "start_ms": 3200, "end_ms": 21400, "label": "product walkthrough", "keep": true },
+    { "start_ms": 21400, "end_ms": 29800, "label": "presenter searches for a tab", "keep": false }
+  ],
+  "captions": [
+    { "start_ms": 3600, "end_ms": 6100, "text": "This is the new dashboard" }
+  ],
+  "notes": "…editorial observations…"
+}
+```
+
+Turning that into an EDL is arithmetic (divide by 1000):
+
+- A **keep segment** `[start_ms, end_ms]` of a clip you reference as `asset:X`
+  becomes a main-track element with `trimStart: start_ms/1000` and
+  `trimEnd: sourceDuration - end_ms/1000`. Several keep segments from the same
+  source are simply several main-track elements with the same `src` and
+  different trims — in order.
+- A **caption** becomes a text overlay with `startTime`/`duration` computed on
+  the **output timeline** (after cutting, output time ≠ source time — offset
+  each caption by the total duration of the kept segments before it).
+
+Analysis is advisory — you decide what to keep. Re-run with a sharper `prompt`
+if the proposal misses the brief.
 
 ### Exporting
 

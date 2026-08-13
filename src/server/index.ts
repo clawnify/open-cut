@@ -9,7 +9,7 @@ import {
 } from "./uploads";
 import { renderComposition } from "./render";
 import { starterEdl, validateEdl, type Edl } from "./edl";
-import { copyOutput, resolveEdlSources, runEdit } from "./export";
+import { analyzeAsset, copyOutput, resolveEdlSources, runEdit } from "./export";
 
 type Bindings = {
   DB: D1Database;
@@ -143,6 +143,29 @@ app.delete("/api/assets/:id", async (c) => {
     await run("DELETE FROM assets WHERE id = ?", [row.id]);
   }
   return c.json({ ok: true });
+});
+
+// AI footage analysis: a multimodal model watches the clip and proposes cuts
+// (millisecond timestamps, keep flags) and caption lines — raw material for
+// EDL edits. See agent.md ("Analyzing footage").
+app.post("/api/assets/:id/analyze", async (c) => {
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json(
+      { error: "Analysis service not configured (missing CLAWNIFY_TOKEN). Analysis runs on deployed apps." },
+      503,
+    );
+  }
+  const b = (await c.req.json<{ mode?: string; prompt?: string }>().catch(() => ({}))) as {
+    mode?: string;
+    prompt?: string;
+  };
+  const res = await analyzeAsset(
+    c.req.param("id"),
+    { mode: b.mode, prompt: b.prompt },
+    { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN },
+  );
+  if ("failure" in res) return c.json(res.failure, 422);
+  return c.json(res.result);
 });
 
 // Serve any R2 object (uploaded media + rendered videos).
