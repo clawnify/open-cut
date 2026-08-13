@@ -18,6 +18,9 @@ type Bindings = {
   CLAWNIFY_TOKEN?: string;
   // Override for local dev (defaults to https://services.clawnify.com).
   SERVICES_URL?: string;
+  // The org's OpenRouter key (declared in clawnify.json `env`, injected at
+  // deploy) — powers footage analysis; usage bills the org's own metering.
+  OPENROUTER_API_KEY?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -162,7 +165,11 @@ app.post("/api/assets/:id/analyze", async (c) => {
   const res = await analyzeAsset(
     c.req.param("id"),
     { mode: b.mode, prompt: b.prompt },
-    { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN },
+    {
+      servicesUrl: c.env.SERVICES_URL,
+      token: c.env.CLAWNIFY_TOKEN,
+      openrouterKey: c.env.OPENROUTER_API_KEY,
+    },
   );
   if ("failure" in res) return c.json(res.failure, 422);
   return c.json(res.result);

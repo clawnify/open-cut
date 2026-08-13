@@ -19,6 +19,8 @@ const RESTAGE_MARGIN_MS = 6 * 60 * 60 * 1000;
 export interface ExportConfig {
   servicesUrl?: string;
   token: string;
+  /** The org's OpenRouter key (injected at deploy) — powers footage analysis. */
+  openrouterKey?: string;
 }
 
 interface AssetRow {
@@ -233,41 +235,90 @@ function analysisPrompt(mode: string, brief?: string): string {
   );
 }
 
+// Flash-class multimodal model with video input; called on the ORG's own
+// metered OpenRouter key (injected at deploy), so usage bills the org directly.
+const ANALYSIS_MODEL = "google/gemini-3.7-flash";
+
 /**
- * Ask the managed analysis service to watch one library asset and propose
- * cuts + captions (millisecond timestamps). Stages the asset first if needed.
+ * Watch one library asset and propose cuts + captions (millisecond
+ * timestamps). Stages the asset if needed, gets a short-lived fetchable URL
+ * from the platform, and calls the model directly on the org's OpenRouter key
+ * — the model fetches the video itself; no bytes move through this worker.
  */
 export async function analyzeAsset(
   assetId: string,
   opts: { mode?: string; prompt?: string },
   cfg: ExportConfig,
 ): Promise<{ result: AnalyzeResult } | { failure: ExportFailure }> {
-  const staged = await ensureStagedSrc(assetId, cfg);
-  if ("failure" in staged) return staged;
-
-  const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
-  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/video/analyze`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      src: staged.src,
-      prompt: analysisPrompt(mode, opts.prompt),
-      schema: ANALYSIS_SCHEMA,
-      schema_name: "edit_analysis",
-    }),
-  });
-  const json = (await res.json().catch(() => null)) as
-    | { model?: string; output?: Partial<AnalyzeResult>; error?: string; detail?: string }
-    | null;
-  if (res.status !== 200 || !Array.isArray(json?.output?.cuts)) {
+  if (!cfg.openrouterKey) {
     return {
       failure: {
-        error: json?.error ?? "analyze_failed",
-        detail: json?.detail ?? `analysis service returned ${res.status}`,
+        error: "analysis_unavailable",
+        detail: "no OpenRouter key available to this app — add one in the dashboard's API Keys settings",
       },
     };
   }
-  return { result: { ...(json.output as AnalyzeResult), model: json.model ?? "" } };
+
+  const staged = await ensureStagedSrc(assetId, cfg);
+  if ("failure" in staged) return staged;
+
+  // Short-lived fetchable URL for the staged file (the model fetches it).
+  const presign = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/files/presign`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ src: staged.src }),
+  });
+  const link = (await presign.json().catch(() => null)) as { url?: string; detail?: string } | null;
+  if (presign.status !== 200 || !link?.url) {
+    return {
+      failure: {
+        error: "analyze_failed",
+        detail: link?.detail ?? `could not presign staged file (${presign.status})`,
+      },
+    };
+  }
+
+  const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.openrouterKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: ANALYSIS_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: analysisPrompt(mode, opts.prompt) },
+            { type: "video_url", video_url: { url: link.url } },
+          ],
+        },
+      ],
+      max_tokens: 6000,
+      temperature: 0.2,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "edit_analysis", strict: true, schema: ANALYSIS_SCHEMA },
+      },
+    }),
+  });
+  if (!res.ok) {
+    return {
+      failure: { error: "analyze_failed", detail: `model call failed (${res.status}): ${(await res.text()).slice(0, 300)}` },
+    };
+  }
+  const completion = (await res.json().catch(() => null)) as
+    | { choices?: { message?: { content?: string } }[] }
+    | null;
+  let parsed: Partial<AnalyzeResult> | null = null;
+  try {
+    parsed = JSON.parse(completion?.choices?.[0]?.message?.content ?? "");
+  } catch {
+    /* fall through to the failure below */
+  }
+  if (!parsed || !Array.isArray(parsed.cuts)) {
+    return { failure: { error: "analyze_failed", detail: "model returned unparseable output — retry" } };
+  }
+  return { result: { ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL } };
 }
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */
