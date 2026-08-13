@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { EditProjectsSection, EditRoute } from "./edit";
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels";
 import {
   ArrowLeft,
@@ -122,8 +123,9 @@ function useRouter() {
 
 export function App() {
   const { path, navigate } = useRouter();
-  // "/" → gallery; "/<id>" → editor. (Strip leading/trailing slashes.)
+  // "/" → gallery; "/edits/<id>" → footage editor; "/<id>" → composition editor.
   const id = decodeURIComponent(path.replace(/^\/+|\/+$/g, ""));
+  const editId = id.startsWith("edits/") ? id.slice(6) : id === "edits" ? "" : null;
 
   return (
     <div className="h-screen flex flex-col text-foreground">
@@ -138,11 +140,17 @@ export function App() {
         ) : (
           <Film className="w-5 h-5 text-primary" />
         )}
-        <span className="font-semibold">Open Video Editor</span>
-        <span className="text-faint text-sm ml-1">HTML → MP4</span>
+        <span className="font-semibold">Open Cut</span>
+        <span className="text-faint text-sm ml-1">edit & render video</span>
       </header>
 
-      {id ? <EditorRoute id={id} navigate={navigate} /> : <Gallery navigate={navigate} />}
+      {editId ? (
+        <EditRoute id={editId} navigate={navigate} />
+      ) : id ? (
+        <EditorRoute id={id} navigate={navigate} />
+      ) : (
+        <Gallery navigate={navigate} />
+      )}
     </div>
   );
 }
@@ -225,6 +233,8 @@ function Gallery({ navigate }: { navigate: (to: string) => void }) {
             ))}
           </div>
         )}
+
+        <EditProjectsSection navigate={navigate} />
       </div>
     </main>
   );
