@@ -281,9 +281,9 @@ export async function analyzeAsset(
       ],
       max_tokens: 6000,
       temperature: 0.2,
-      // Structured-output support is per ENDPOINT, not per model — only route
-      // to providers that honor response_format.
-      provider: { require_parameters: true },
+      // NB: no provider.require_parameters — the Google endpoint honors
+      // response_format in practice but doesn't advertise it, and requiring
+      // the advertisement empties the routing pool (404 no endpoints).
       response_format: {
         type: "json_schema",
         json_schema: { name: "edit_analysis", strict: true, schema: ANALYSIS_SCHEMA },
@@ -498,9 +498,9 @@ export async function autocutAssets(
       ],
       max_tokens: 6000,
       temperature: 0.3,
-      // Structured-output support is per ENDPOINT, not per model — only route
-      // to providers that honor response_format.
-      provider: { require_parameters: true },
+      // NB: no provider.require_parameters — the Google endpoint honors
+      // response_format in practice but doesn't advertise it, and requiring
+      // the advertisement empties the routing pool (404 no endpoints).
       response_format: {
         type: "json_schema",
         json_schema: { name: "autocut", strict: true, schema: AUTOCUT_SCHEMA },
