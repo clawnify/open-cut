@@ -38,7 +38,11 @@ CREATE TABLE IF NOT EXISTS assets (
   -- it from the local file instantly). Data, not a runtime probe — the
   -- timeline needs it synchronously, and moov-at-end files make network
   -- probing arbitrarily slow.
-  duration REAL
+  duration REAL,
+  -- Small 360p transcode used for AI analysis (models take base64 with a hard
+  -- request cap; full-res footage doesn't fit). Made once via the edit
+  -- service, cached here in app storage.
+  proxy_key TEXT
 );
 
 -- Render jobs: one row per render. The MP4 is stored in R2 and served from

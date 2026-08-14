@@ -159,9 +159,12 @@ app.patch("/api/assets/:id", async (c) => {
 });
 
 app.delete("/api/assets/:id", async (c) => {
-  const row = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  const row = await get<Asset & { proxy_key?: string | null }>("SELECT * FROM assets WHERE id = ?", [
+    c.req.param("id"),
+  ]);
   if (row) {
     await deleteUpload(row.key);
+    if (row.proxy_key) await deleteUpload(row.proxy_key);
     await run("DELETE FROM assets WHERE id = ?", [row.id]);
   }
   return c.json({ ok: true });

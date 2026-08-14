@@ -8,7 +8,7 @@
 // streams — nothing is buffered in the worker.
 
 import { get, run } from "./db";
-import { getUpload, putUpload } from "./uploads";
+import { getUpload, getUploadBytes, putUpload } from "./uploads";
 import { collectAssetIds, substituteAssetSrcs, type Edl, type EdlInvalid } from "./edl";
 
 const DEFAULT_SERVICES_URL = "https://services.clawnify.com";
@@ -31,6 +31,7 @@ interface AssetRow {
   size: number;
   service_key: string | null;
   service_key_expires_at: string | null;
+  proxy_key: string | null;
 }
 
 export interface ExportFailure {
@@ -260,24 +261,8 @@ export async function analyzeAsset(
     };
   }
 
-  const staged = await ensureStagedSrc(assetId, cfg);
-  if ("failure" in staged) return staged;
-
-  // Short-lived fetchable URL for the staged file (the model fetches it).
-  const presign = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/files/presign`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ src: staged.src }),
-  });
-  const link = (await presign.json().catch(() => null)) as { url?: string; detail?: string } | null;
-  if (presign.status !== 200 || !link?.url) {
-    return {
-      failure: {
-        error: "analyze_failed",
-        detail: link?.detail ?? `could not presign staged file (${presign.status})`,
-      },
-    };
-  }
+  const media = await analysisDataUrl(assetId, cfg);
+  if ("failure" in media) return media;
 
   const mode = ["cuts", "captions", "both"].includes(opts.mode ?? "") ? opts.mode! : "both";
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -290,12 +275,15 @@ export async function analyzeAsset(
           role: "user",
           content: [
             { type: "text", text: analysisPrompt(mode, opts.prompt) },
-            { type: "video_url", video_url: { url: link.url } },
+            { type: "video_url", video_url: { url: media.dataUrl } },
           ],
         },
       ],
       max_tokens: 6000,
       temperature: 0.2,
+      // Structured-output support is per ENDPOINT, not per model — only route
+      // to providers that honor response_format.
+      provider: { require_parameters: true },
       response_format: {
         type: "json_schema",
         json_schema: { name: "edit_analysis", strict: true, schema: ANALYSIS_SCHEMA },
@@ -322,18 +310,86 @@ export async function analyzeAsset(
   return { result: { ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL } };
 }
 
-/** Short-lived fetchable URL for a staged src (the platform presigns it). */
-async function presignStaged(src: string, cfg: ExportConfig): Promise<{ url: string } | { failure: ExportFailure }> {
-  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/files/presign`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ src }),
-  });
-  const json = (await res.json().catch(() => null)) as { url?: string; detail?: string } | null;
-  if (res.status !== 200 || !json?.url) {
-    return { failure: { error: "analyze_failed", detail: json?.detail ?? `could not presign staged file (${res.status})` } };
+// ── analysis delivery: base64 data URLs over a small proxy ──────────────────
+// Models take video as base64 data URLs with a hard per-request cap (direct
+// file URLs are NOT supported by the Google providers), so full-res footage
+// never fits. Small originals go straight through; everything else gets a
+// one-time 360p/24fps "analysis proxy" made by the edit service and cached in
+// this app's storage. Timestamps map 1:1 — the proxy is the same timeline.
+
+const DIRECT_ANALYSIS_BYTES = 12 * 1024 * 1024; // originals up to this go as-is
+const ANALYSIS_HARD_CAP = 15 * 1024 * 1024; // absolute per-clip payload cap
+const AUTOCUT_COMBINED_CAP = 14 * 1024 * 1024; // all clips in one request
+const DIRECT_TYPES = new Set(["video/mp4", "video/webm", "video/mpeg", "video/quicktime", "video/mov"]);
+
+function bytesToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
-  return { url: json.url };
+  return btoa(binary);
+}
+
+/**
+ * Bytes the model will watch for one asset: the original when it's small and
+ * an accepted format, else the cached 360p proxy (made on first use).
+ */
+async function analysisBytes(
+  asset: AssetRow,
+  cfg: ExportConfig,
+): Promise<{ bytes: ArrayBuffer } | { failure: ExportFailure }> {
+  if (asset.size <= DIRECT_ANALYSIS_BYTES && DIRECT_TYPES.has(asset.content_type)) {
+    const bytes = await getUploadBytes(asset.key);
+    if (bytes) return { bytes };
+  }
+
+  if (!asset.proxy_key) {
+    const staged = await ensureStagedSrc(asset.id, cfg);
+    if ("failure" in staged) return staged;
+    const proxied = await runEdit(
+      {
+        version: 1,
+        output: { width: 640, height: 360, fps: 24, background: "#000000" },
+        main: { elements: [{ id: "p", type: "video", src: staged.src }] },
+        overlays: [],
+        audio: [],
+      } as Edl,
+      { quality: "draft", filename: `proxy-${asset.id}.mp4` },
+      cfg,
+    );
+    if ("failure" in proxied) {
+      const detail = proxied.failure.detail.includes("max is")
+        ? "clip is longer than 5 minutes — trim it before analysis"
+        : `could not build the analysis proxy: ${proxied.failure.detail}`;
+      return { failure: { error: "analyze_failed", detail } };
+    }
+    const key = `proxies/${asset.id}.mp4`;
+    await copyOutput(proxied.result, key);
+    await run("UPDATE assets SET proxy_key = ? WHERE id = ?", [key, asset.id]);
+    asset.proxy_key = key;
+  }
+
+  const bytes = await getUploadBytes(asset.proxy_key);
+  if (!bytes) return { failure: { error: "analyze_failed", detail: "analysis proxy missing — retry" } };
+  if (bytes.byteLength > ANALYSIS_HARD_CAP) {
+    return { failure: { error: "analyze_failed", detail: "clip too long for analysis — trim it first" } };
+  }
+  return { bytes };
+}
+
+async function analysisDataUrl(
+  assetId: string,
+  cfg: ExportConfig,
+): Promise<{ dataUrl: string; byteLength: number } | { failure: ExportFailure }> {
+  const asset = await get<AssetRow>("SELECT * FROM assets WHERE id = ?", [assetId]);
+  if (!asset) {
+    return { failure: { error: "asset_not_found", detail: `no media-library asset with id "${assetId}"` } };
+  }
+  const res = await analysisBytes(asset, cfg);
+  if ("failure" in res) return res;
+  return { dataUrl: `data:video/mp4;base64,${bytesToBase64(res.bytes)}`, byteLength: res.bytes.byteLength };
 }
 
 export interface AutocutSegment {
@@ -399,12 +455,20 @@ export async function autocutAssets(
   }
 
   const urls: string[] = [];
+  let combined = 0;
   for (const a of assets) {
-    const staged = await ensureStagedSrc(a.id, cfg);
-    if ("failure" in staged) return staged;
-    const link = await presignStaged(staged.src, cfg);
-    if ("failure" in link) return link;
-    urls.push(link.url);
+    const media = await analysisDataUrl(a.id, cfg);
+    if ("failure" in media) return media;
+    combined += media.byteLength;
+    if (combined > AUTOCUT_COMBINED_CAP) {
+      return {
+        failure: {
+          error: "autocut_failed",
+          detail: "too much footage for one Auto-cut pass — use fewer or shorter clips (roughly 8 proxy-minutes total)",
+        },
+      };
+    }
+    urls.push(media.dataUrl);
   }
 
   const clipList = assets.map((a, i) => `Clip ${i} — "${a.name}"`).join("; ");
@@ -434,6 +498,9 @@ export async function autocutAssets(
       ],
       max_tokens: 6000,
       temperature: 0.3,
+      // Structured-output support is per ENDPOINT, not per model — only route
+      // to providers that honor response_format.
+      provider: { require_parameters: true },
       response_format: {
         type: "json_schema",
         json_schema: { name: "autocut", strict: true, schema: AUTOCUT_SCHEMA },
