@@ -460,6 +460,22 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const segments = useMemo(() => mainSegments(edl, srcDur), [edl, srcDur]);
   const total = segments.reduce((a, s) => a + s.dur, 0);
 
+  // Distinct video clips on the main track, in timeline order — the unit
+  // Auto-cut operates on (the arrangement is the user's intent).
+  const timelineClips = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Asset[] = [];
+    for (const el of edl.main.elements) {
+      if (el.type !== "video" || !el.src.startsWith("asset:")) continue;
+      const id = el.src.slice(6);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const a = assets.find((x) => x.id === id);
+      if (a) out.push(a);
+    }
+    return out;
+  }, [edl, assets]);
+
   const seek = useCallback((t: number) => {
     const clamped = Math.max(0, Math.min(t, Math.max(0.001, total)));
     playheadRef.current = clamped;
@@ -581,7 +597,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       {autocutOpen && (
         <AutocutModal
           projectId={initial.id}
-          assets={assets.filter(isVideoAsset)}
+          clips={timelineClips}
           brief={brief}
           setBrief={setBrief}
           onClose={() => setAutocutOpen(false)}
@@ -654,20 +670,19 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
 
 function AutocutModal({
   projectId,
-  assets,
+  clips,
   brief,
   setBrief,
   onClose,
   onApplied,
 }: {
   projectId: string;
-  assets: Asset[];
+  clips: Asset[];
   brief: string;
   setBrief: (b: string) => void;
   onClose: () => void;
   onApplied: (edl: Edl) => void;
 }) {
-  const [picked, setPicked] = useState<Set<string>>(new Set(assets.map((a) => a.id)));
   const [running, setRunning] = useState(false);
   const [msg, setMsg] = useState("");
 
@@ -676,7 +691,7 @@ function AutocutModal({
     setMsg("Watching all clips together — this takes a minute for long footage…");
     try {
       const res = await api.send<EditProject & { notes?: string }>("POST", `/api/projects/${projectId}/autocut`, {
-        asset_ids: [...picked],
+        asset_ids: clips.map((c) => c.id),
       });
       onApplied(res.edl);
       void res.notes;
@@ -696,8 +711,8 @@ function AutocutModal({
           <Sparkles className="w-4 h-4 text-primary" /> Auto-cut
         </h2>
         <p className="text-sm text-muted mb-4">
-          One pass watches every selected clip together and assembles the strongest sequence for your brief —
-          ordering, trims and captions included. The result lands on the timeline for you to adjust.
+          One pass watches every clip on your timeline together and assembles the strongest sequence for your
+          brief — ordering, trims and captions included. The result replaces the main track, ready to adjust.
         </p>
 
         <Row label="What is this video for?">
@@ -709,27 +724,23 @@ function AutocutModal({
           />
         </Row>
 
-        <Row label={`Clips (${picked.size} selected)`}>
+        <Row label={`Clips on the timeline (${clips.length})`}>
           <div className="max-h-44 overflow-y-auto space-y-1 border border-border rounded-sm p-2">
-            {assets.length === 0 && <div className="text-xs text-faint py-2 text-center">Upload video clips in the Media panel first.</div>}
-            {assets.map((a) => (
-              <label key={a.id} className="flex items-center gap-2 text-sm py-0.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={picked.has(a.id)}
-                  onChange={(e) => {
-                    const next = new Set(picked);
-                    if (e.target.checked) next.add(a.id);
-                    else next.delete(a.id);
-                    setPicked(next);
-                  }}
-                />
+            {clips.length === 0 && (
+              <div className="text-xs text-faint py-2 text-center">
+                Add video clips to the timeline first (Media panel → click a clip).
+              </div>
+            )}
+            {clips.map((a, i) => (
+              <div key={a.id} className="flex items-center gap-2 text-sm py-0.5">
+                <span className="text-faint text-xs w-4">{i + 1}.</span>
                 <span className="truncate">{a.name}</span>
-              </label>
+              </div>
             ))}
           </div>
         </Row>
 
+        {clips.length > 8 && <div className="text-xs text-danger mb-2">Auto-cut handles up to 8 clips at once.</div>}
         {msg && <div className="text-xs text-muted mb-3">{msg}</div>}
         <div className="flex justify-end gap-2">
           <button onClick={onClose} className="px-3 py-1.5 rounded-sm border border-border text-sm hover:bg-surface-sunken">
@@ -737,7 +748,7 @@ function AutocutModal({
           </button>
           <button
             onClick={run}
-            disabled={running || picked.size === 0 || picked.size > 8}
+            disabled={running || clips.length === 0 || clips.length > 8}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60"
           >
             {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Assemble cut
@@ -1186,10 +1197,10 @@ function Inspector({
               </Row>
               <SliderRow label="Volume" value={el.volume ?? 1} max={2} onChange={(n) => set((e) => ((e as MainVideo).volume = n))} />
               <button
-                disabled={analyzing || dur === undefined}
+                disabled={analyzing}
                 onClick={async () => {
                   const a = resolveAsset(el.src);
-                  if (!a || dur === undefined) return;
+                  if (!a) return;
                   setAnalyzing(true);
                   setAnalyzeMsg("");
                   try {
