@@ -9,7 +9,7 @@ import {
 } from "./uploads";
 import { renderComposition } from "./render";
 import { starterEdl, validateEdl, type Edl } from "./edl";
-import { analyzeAsset, copyOutput, resolveEdlSources, runEdit } from "./export";
+import { analyzeAsset, autocutAssets, copyOutput, resolveEdlSources, runEdit } from "./export";
 
 type Bindings = {
   DB: D1Database;
@@ -262,6 +262,7 @@ interface EditProject {
   id: string;
   name: string;
   edl: string;
+  brief: string;
   created_at: string;
   updated_at: string;
 }
@@ -297,7 +298,7 @@ app.get("/api/projects/:id", async (c) => {
 });
 
 app.post("/api/projects", async (c) => {
-  const b = await c.req.json<{ name?: string; edl?: unknown }>();
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string }>();
   if (!b.name?.trim()) return c.json({ error: "name is required" }, 400);
 
   let edl: Edl;
@@ -310,10 +311,11 @@ app.post("/api/projects", async (c) => {
   }
 
   const id = crypto.randomUUID();
-  await run("INSERT INTO edit_projects (id, name, edl) VALUES (?, ?, ?)", [
+  await run("INSERT INTO edit_projects (id, name, edl, brief) VALUES (?, ?, ?, ?)", [
     id,
     b.name.trim(),
     JSON.stringify(edl),
+    b.brief?.trim() ?? "",
   ]);
   const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
   return c.json(projectOut(row!), 201);
@@ -324,7 +326,7 @@ app.put("/api/projects/:id", async (c) => {
   const existing = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
   if (!existing) return c.json({ error: "Not found" }, 404);
 
-  const b = await c.req.json<{ name?: string; edl?: unknown }>();
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string }>();
   let edlJson = existing.edl;
   if (b.edl !== undefined) {
     const v = validateEdl(b.edl);
@@ -332,11 +334,94 @@ app.put("/api/projects/:id", async (c) => {
     edlJson = JSON.stringify(v.edl);
   }
   await run(
-    "UPDATE edit_projects SET name = ?, edl = ?, updated_at = datetime('now') WHERE id = ?",
-    [b.name?.trim() || existing.name, edlJson, id],
+    "UPDATE edit_projects SET name = ?, edl = ?, brief = ?, updated_at = datetime('now') WHERE id = ?",
+    [b.name?.trim() || existing.name, edlJson, b.brief !== undefined ? b.brief.trim() : existing.brief, id],
   );
   const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
   return c.json(projectOut(row!));
+});
+
+// Auto-cut: assemble the project's main track from several clips in ONE model
+// pass — the model watches every clip together (ordering and cross-clip
+// redundancy can't be judged one clip at a time) against the project brief.
+// Replaces the main track and adds a captions overlay; other overlay/audio
+// tracks are left untouched.
+app.post("/api/projects/:id/autocut", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json({ error: "Auto-cut runs on deployed apps (missing CLAWNIFY_TOKEN)." }, 503);
+  }
+
+  const b = await c.req
+    .json<{ asset_ids?: string[]; prompt?: string }>()
+    .catch(() => ({}) as { asset_ids?: string[]; prompt?: string });
+  const ids = Array.isArray(b.asset_ids) ? b.asset_ids : [];
+  if (ids.length === 0) return c.json({ error: "autocut_failed", detail: "asset_ids is required" }, 422);
+
+  const clips: { id: string; name: string }[] = [];
+  for (const id of ids) {
+    const a = await get<Asset>("SELECT * FROM assets WHERE id = ?", [id]);
+    if (!a) return c.json({ error: "autocut_failed", detail: `no asset with id "${id}"` }, 422);
+    if (!a.content_type.startsWith("video/")) {
+      return c.json({ error: "autocut_failed", detail: `"${a.name}" is not a video` }, 422);
+    }
+    clips.push({ id: a.id, name: a.name });
+  }
+
+  const brief = [project.brief, b.prompt].filter((s) => s?.trim()).join(" — ");
+  const cut = await autocutAssets(clips, brief, {
+    servicesUrl: c.env.SERVICES_URL,
+    token: c.env.CLAWNIFY_TOKEN,
+    openrouterKey: c.env.OPENROUTER_API_KEY,
+  });
+  if ("failure" in cut) return c.json(cut.failure, 422);
+
+  // Sequence → main track (duration = play-window, no source length needed);
+  // captions → one overlay track with cumulative output-time offsets.
+  const edl = JSON.parse(project.edl) as Edl;
+  const rid = () => Math.random().toString(36).slice(2, 10);
+  edl.main.elements = cut.result.sequence.map((s) => ({
+    id: rid(),
+    type: "video" as const,
+    src: `asset:${clips[s.clip_index].id}`,
+    trimStart: Math.round(s.start_ms) / 1000,
+    duration: Math.max(0.05, Math.round(s.end_ms - s.start_ms) / 1000),
+  }));
+  let at = 0;
+  const captions = [];
+  for (const s of cut.result.sequence) {
+    const dur = Math.max(0.05, (s.end_ms - s.start_ms) / 1000);
+    if (s.caption.trim()) {
+      captions.push({
+        id: rid(),
+        type: "text" as const,
+        text: s.caption.trim(),
+        fontSize: Math.round(edl.output.height * 0.055),
+        startTime: Math.round(at * 100) / 100,
+        duration: Math.min(dur, 6),
+        x: 0.5,
+        y: 0.82,
+        align: "center" as const,
+        color: "#ffffff",
+        background: "#000000a0",
+      });
+    }
+    at += dur;
+  }
+  if (captions.length) {
+    edl.overlays = edl.overlays ?? [];
+    edl.overlays.push({ id: rid(), elements: captions });
+  }
+
+  const v = validateEdl(edl);
+  if ("invalid" in v) return c.json(v.invalid, 422);
+  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
+    JSON.stringify(v.edl),
+    project.id,
+  ]);
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [project.id]);
+  return c.json({ ...projectOut(row!), notes: cut.result.notes });
 });
 
 app.delete("/api/projects/:id", async (c) => {

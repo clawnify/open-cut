@@ -46,6 +46,8 @@ interface MainVideo {
   src: string;
   trimStart?: number;
   trimEnd?: number;
+  /** Play-window seconds from trimStart; wins over trimEnd. */
+  duration?: number;
   sourceAudio?: boolean;
   volume?: number;
   fit?: "contain" | "cover";
@@ -122,6 +124,7 @@ export interface EditProject {
   id: string;
   name: string;
   edl: Edl;
+  brief: string;
   updated_at: string;
 }
 
@@ -183,6 +186,10 @@ function fmtTime(t: number): string {
 function mainDur(el: MainElement, srcDur: (src: string) => number | undefined): number {
   if (el.type === "image") return el.duration;
   const d = srcDur(el.src);
+  if (el.duration !== undefined) {
+    // Play-window form: usable even before metadata loads (clamped when known).
+    return d === undefined ? el.duration : Math.min(el.duration, Math.max(0, d - (el.trimStart ?? 0)));
+  }
   if (d === undefined) return 0;
   return Math.max(0, d - (el.trimStart ?? 0) - (el.trimEnd ?? 0));
 }
@@ -411,6 +418,7 @@ export function EditRoute({ id, navigate }: { id: string; navigate: (to: string)
 
 export function EditEditor({ initial, initialAssets }: { initial: EditProject; initialAssets: Asset[] }) {
   const [name, setName] = useState(initial.name);
+  const [brief, setBrief] = useState(initial.brief ?? "");
   const [edl, setEdl] = useState<Edl>(initial.edl);
   const [assets, setAssets] = useState<Asset[]>(initialAssets);
   const [sel, setSel] = useState<Sel>(null);
@@ -418,18 +426,19 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
   const [saveState, setSaveState] = useState<"saved" | "saving" | string>("saved");
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(0);
+  const [autocutOpen, setAutocutOpen] = useState(false);
   const playheadRef = useRef(0);
   const { srcDur, resolveAsset } = useSourceDurations(edl, assets);
 
   // ── persistence (debounced) ───────────────────────────────────────────────
   const dirty = useRef(false);
   useEffect(() => {
-    if (edl === initial.edl && name === initial.name) return;
+    if (edl === initial.edl && name === initial.name && brief === (initial.brief ?? "")) return;
     dirty.current = true;
     setSaveState("saving");
     const t = setTimeout(async () => {
       try {
-        await api.send("PUT", `/api/projects/${initial.id}`, { name, edl });
+        await api.send("PUT", `/api/projects/${initial.id}`, { name, edl, brief });
         dirty.current = false;
         setSaveState("saved");
       } catch (e) {
@@ -437,7 +446,7 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
       }
     }, 700);
     return () => clearTimeout(t);
-  }, [edl, name, initial.id, initial.edl, initial.name]);
+  }, [edl, name, brief, initial.id, initial.edl, initial.name, initial.brief]);
 
   const update = useCallback((fn: (draft: Edl) => void) => {
     setEdl((cur) => {
@@ -559,8 +568,31 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           {saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : saveState}
         </span>
         <div className="flex-1" />
+        <button
+          onClick={() => setAutocutOpen(true)}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm border border-border text-sm hover:bg-surface-sunken"
+          title="Assemble a cut from several clips with AI"
+        >
+          <Sparkles className="w-4 h-4 text-primary" /> Auto-cut
+        </button>
         <ExportControls projectId={initial.id} disabled={dirty.current || edl.main.elements.length === 0} />
       </div>
+
+      {autocutOpen && (
+        <AutocutModal
+          projectId={initial.id}
+          assets={assets.filter(isVideoAsset)}
+          brief={brief}
+          setBrief={setBrief}
+          onClose={() => setAutocutOpen(false)}
+          onApplied={(next) => {
+            setEdl(next);
+            setSel(null);
+            setAutocutOpen(false);
+            seek(0);
+          }}
+        />
+      )}
 
       {/* three-panel middle */}
       <div className="flex-1 flex min-h-0">
@@ -592,6 +624,8 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
           resolveAsset={resolveAsset}
           segments={segments}
           onDelete={deleteSelected}
+          brief={brief}
+          setBrief={setBrief}
         />
       </div>
 
@@ -612,6 +646,104 @@ export function EditEditor({ initial, initialAssets }: { initial: EditProject; i
         splitAtPlayhead={splitAtPlayhead}
         deleteSelected={deleteSelected}
       />
+    </div>
+  );
+}
+
+// ── auto-cut modal ──────────────────────────────────────────────────────────
+
+function AutocutModal({
+  projectId,
+  assets,
+  brief,
+  setBrief,
+  onClose,
+  onApplied,
+}: {
+  projectId: string;
+  assets: Asset[];
+  brief: string;
+  setBrief: (b: string) => void;
+  onClose: () => void;
+  onApplied: (edl: Edl) => void;
+}) {
+  const [picked, setPicked] = useState<Set<string>>(new Set(assets.map((a) => a.id)));
+  const [running, setRunning] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const run = async () => {
+    setRunning(true);
+    setMsg("Watching all clips together — this takes a minute for long footage…");
+    try {
+      const res = await api.send<EditProject & { notes?: string }>("POST", `/api/projects/${projectId}/autocut`, {
+        asset_ids: [...picked],
+      });
+      onApplied(res.edl);
+      void res.notes;
+    } catch (e) {
+      setMsg(String((e as Error).message));
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 grid place-items-center p-6" onPointerDown={onClose}>
+      <div
+        className="w-full max-w-md rounded-lg border border-border bg-surface p-5 shadow-lg"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <h2 className="font-semibold flex items-center gap-2 mb-1">
+          <Sparkles className="w-4 h-4 text-primary" /> Auto-cut
+        </h2>
+        <p className="text-sm text-muted mb-4">
+          One pass watches every selected clip together and assembles the strongest sequence for your brief —
+          ordering, trims and captions included. The result lands on the timeline for you to adjust.
+        </p>
+
+        <Row label="What is this video for?">
+          <textarea
+            className={`${inputCls} min-h-16`}
+            placeholder="e.g. 30-second product teaser for Instagram — energetic, lead with the best demo moment"
+            value={brief}
+            onChange={(e) => setBrief(e.target.value)}
+          />
+        </Row>
+
+        <Row label={`Clips (${picked.size} selected)`}>
+          <div className="max-h-44 overflow-y-auto space-y-1 border border-border rounded-sm p-2">
+            {assets.length === 0 && <div className="text-xs text-faint py-2 text-center">Upload video clips in the Media panel first.</div>}
+            {assets.map((a) => (
+              <label key={a.id} className="flex items-center gap-2 text-sm py-0.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={picked.has(a.id)}
+                  onChange={(e) => {
+                    const next = new Set(picked);
+                    if (e.target.checked) next.add(a.id);
+                    else next.delete(a.id);
+                    setPicked(next);
+                  }}
+                />
+                <span className="truncate">{a.name}</span>
+              </label>
+            ))}
+          </div>
+        </Row>
+
+        {msg && <div className="text-xs text-muted mb-3">{msg}</div>}
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-1.5 rounded-sm border border-border text-sm hover:bg-surface-sunken">
+            Cancel
+          </button>
+          <button
+            onClick={run}
+            disabled={running || picked.size === 0 || picked.size > 8}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60"
+          >
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Assemble cut
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -694,9 +826,12 @@ function LeftPanel({
             <input
               ref={fileRef}
               type="file"
+              multiple
               accept={tab === "audio" ? "audio/*" : "video/*,image/*"}
               className="hidden"
-              onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])}
+              onChange={(e) => {
+                for (const f of Array.from(e.target.files ?? [])) upload(f);
+              }}
             />
             <div className="space-y-2">
               {list.map((a) => (
@@ -982,6 +1117,8 @@ function Inspector({
   resolveAsset,
   segments,
   onDelete,
+  brief,
+  setBrief,
 }: {
   edl: Edl;
   sel: Sel;
@@ -990,6 +1127,8 @@ function Inspector({
   resolveAsset: (src: string) => Asset | undefined;
   segments: ReturnType<typeof mainSegments>;
   onDelete: () => void;
+  brief: string;
+  setBrief: (b: string) => void;
 }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeMsg, setAnalyzeMsg] = useState("");
@@ -997,9 +1136,21 @@ function Inspector({
   const body = () => {
     if (!sel)
       return (
-        <div className="text-sm text-faint mt-6 text-center px-4">
-          Select a clip to edit
-          <div className="mt-2 text-xs">Canvas: {edl.output.width}×{edl.output.height} @ {edl.output.fps}fps</div>
+        <div className="mt-2">
+          <Row label="Project brief — what is this video for?">
+            <textarea
+              className={`${inputCls} min-h-20`}
+              placeholder="e.g. 30-second product teaser for Instagram — energetic"
+              value={brief}
+              onChange={(e) => setBrief(e.target.value)}
+            />
+          </Row>
+          <p className="text-xs text-faint">
+            The brief anchors every AI action — cuts are only "effective" relative to a goal.
+          </p>
+          <div className="mt-4 text-xs text-faint text-center">
+            Canvas: {edl.output.width}×{edl.output.height} @ {edl.output.fps}fps · Select a clip to edit it
+          </div>
         </div>
       );
 
@@ -1014,7 +1165,11 @@ function Inspector({
           {el.type === "video" ? (
             <>
               <NumberRow label="Trim start (s)" value={el.trimStart ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimStart = Math.max(0, n)))} />
-              <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
+              {el.duration !== undefined ? (
+                <NumberRow label="Play duration (s)" value={el.duration} min={0.1} onChange={(n) => set((e) => ((e as MainVideo).duration = Math.max(0.1, n)))} />
+              ) : (
+                <NumberRow label="Trim end (s)" value={el.trimEnd ?? 0} min={0} onChange={(n) => set((e) => ((e as MainVideo).trimEnd = Math.max(0, n)))} />
+              )}
               <Row label="Fit">
                 <select className={inputCls} value={el.fit ?? "contain"} onChange={(e) => set((x) => ((x as MainVideo).fit = e.target.value as "contain" | "cover"))}>
                   <option value="contain">Contain (letterbox)</option>
@@ -1038,7 +1193,23 @@ function Inspector({
                   setAnalyzing(true);
                   setAnalyzeMsg("");
                   try {
-                    const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, { mode: "both" });
+                    // Give the model the purpose + surroundings — even cleanup
+                    // shouldn't be blind to what the clip sits inside.
+                    const others = segments
+                      .filter((s) => s.i !== sel.i)
+                      .map((s) => resolveAsset(s.el.src)?.name)
+                      .filter(Boolean)
+                      .join(", ");
+                    const context = [
+                      brief && `Project purpose: ${brief}.`,
+                      others && `On the timeline it sits alongside: ${others}.`,
+                    ]
+                      .filter(Boolean)
+                      .join(" ");
+                    const r = await api.send<AnalyzeResult>("POST", `/api/assets/${a.id}/analyze`, {
+                      mode: "both",
+                      ...(context ? { prompt: context } : {}),
+                    });
                     const keeps = r.cuts.filter((c) => c.keep).sort((x, y) => x.start_ms - y.start_ms);
                     if (keeps.length === 0) {
                       setAnalyzeMsg("No keep-segments proposed.");
@@ -1047,12 +1218,11 @@ function Inspector({
                     const before = segments.slice(0, segments.findIndex((s) => s.i === sel.i)).reduce((acc, s) => acc + s.dur, 0);
                     update((d) => {
                       const base = d.main.elements[sel.i] as MainVideo;
-                      const parts: MainVideo[] = keeps.map((k) => ({
-                        ...structuredClone(base),
-                        id: rid(),
-                        trimStart: k.start_ms / 1000,
-                        trimEnd: Math.max(0, dur - k.end_ms / 1000),
-                      }));
+                      const parts: MainVideo[] = keeps.map((k) => {
+                        const p = { ...structuredClone(base), id: rid(), trimStart: k.start_ms / 1000, duration: (k.end_ms - k.start_ms) / 1000 };
+                        delete p.trimEnd;
+                        return p;
+                      });
                       d.main.elements.splice(sel.i, 1, ...parts);
                       // Captions land on the output timeline: offset each by the
                       // kept time that precedes it inside this clip.
@@ -1097,7 +1267,7 @@ function Inspector({
                 }}
                 className="w-full mt-1 mb-2 py-2 rounded-sm bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover disabled:opacity-60 flex items-center justify-center gap-1.5"
               >
-                {analyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Propose cuts (AI)
+                {analyzing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />} Clean up clip (AI)
               </button>
               {analyzeMsg && <div className="text-xs text-muted mb-2">{analyzeMsg}</div>}
             </>
@@ -1328,6 +1498,18 @@ function TimelinePanel({
         if (t.type === "image") {
           const o = orig as MainImage;
           t.duration = Math.max(0.2, side === "r" ? o.duration + ds : o.duration - ds);
+        } else if ((orig as MainVideo).duration !== undefined) {
+          // Play-window form: left handle moves the in-point (window shrinks),
+          // right handle grows/shrinks the window; export clamps to the source.
+          const o = orig as MainVideo;
+          const tv = t as MainVideo;
+          if (side === "l") {
+            const shift = Math.max(-(o.trimStart ?? 0), Math.min(ds, o.duration! - 0.2));
+            tv.trimStart = Math.round(((o.trimStart ?? 0) + shift) * 100) / 100;
+            tv.duration = Math.round((o.duration! - shift) * 100) / 100;
+          } else {
+            tv.duration = Math.max(0.2, Math.round((o.duration! + ds) * 100) / 100);
+          }
         } else if (src !== undefined) {
           const o = orig as MainVideo;
           if (side === "l") {

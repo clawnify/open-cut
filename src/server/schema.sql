@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS edit_projects (
   ),
   name TEXT NOT NULL,
   edl TEXT NOT NULL,
+  -- The video's purpose ("30s product teaser for Instagram, energetic").
+  -- Anchors every AI call — cuts are only "effective" relative to a goal.
+  brief TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

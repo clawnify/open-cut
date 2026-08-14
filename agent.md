@@ -63,9 +63,10 @@ also upload programmatically with a multipart `POST /api/assets`.)
 | POST | `/api/renders` | Render `{ composition_id }` → returns the job |
 | GET  | `/api/renders` | List render jobs |
 | GET  | `/api/projects` | List footage edit projects |
-| GET  | `/api/projects/{id}` | Get one (includes the `edl` document) |
-| POST | `/api/projects` | Create `{ name, edl? }` (empty 720p timeline if omitted) |
-| PUT  | `/api/projects/{id}` | Update `{ name?, edl? }` — the EDL is validated on save |
+| GET  | `/api/projects/{id}` | Get one (includes the `edl` document and `brief`) |
+| POST | `/api/projects` | Create `{ name, brief?, edl? }` (empty 720p timeline if omitted) |
+| PUT  | `/api/projects/{id}` | Update `{ name?, brief?, edl? }` — the EDL is validated on save |
+| POST | `/api/projects/{id}/autocut` | `{ asset_ids, prompt? }` — AI assembles the main track from several clips |
 | DELETE | `/api/projects/{id}` | Delete a project and its export history |
 | POST | `/api/projects/{id}/export` | Export `{ quality? }` → returns the job (blocks until done) |
 | GET  | `/api/exports?project_id={id}` | Export history |
@@ -127,9 +128,13 @@ A complete document:
 ```
 
 Field reference (main-track clips): `trimStart`/`trimEnd` cut seconds off the
-source's head/tail; `fit` is `"contain"` (letterbox on the background color,
-default) or `"cover"` (fill and crop); `sourceAudio: false` mutes a clip's own
-sound; images need an explicit `duration`. Text overlays: `fontFamily`
+source's head/tail; video clips also accept `duration` — **play N seconds from
+`trimStart`** — which wins over `trimEnd` and lets you cut without knowing the
+source's length (prefer it when working from analysis timestamps:
+`trimStart: start_ms/1000, duration: (end_ms-start_ms)/1000`); `fit` is
+`"contain"` (letterbox on the background color, default) or `"cover"` (fill
+and crop); `sourceAudio: false` mutes a clip's own sound; images need an
+explicit `duration`. Text overlays: `fontFamily`
 (`sans`/`serif`/`mono`), `fontSize` in px at output resolution, optional boxed
 `background` (`#RRGGBBAA` works). Media overlays: `width` as a fraction of
 canvas width, height keeps aspect. Audio elements: `volume` 0..2, `duration`
@@ -168,9 +173,36 @@ index 1 of `main.elements` (nothing else changes — no start-time math):
   "color": "#ffffff", "background": "#000000aa" }
 ```
 
-### Analyzing footage (AI cut proposals)
+### The brief: purpose comes first
 
-Before editing a long or unfamiliar clip, ask for an analysis:
+A cut is only "effective" relative to a goal — without one, the only honest
+edit is mechanical cleanup (dead air, false starts). So: **set the project's
+`brief`** ("30-second product teaser for Instagram — energetic") before asking
+for AI help, and it anchors every AI action. Ask the user for the purpose if
+you don't know it.
+
+### Auto-cut: assemble from several clips
+
+When the user has multiple raw clips ("cut these together the best way"),
+don't analyze them one at a time — ordering and cross-clip redundancy can't be
+judged per clip. Use:
+
+```
+POST /api/projects/{id}/autocut
+{ "asset_ids": ["<video asset ids>"], "prompt": "optional extra steer" }
+```
+
+One model pass watches **all** the clips together against the project brief
+and replaces the main track with the assembled sequence (using
+`trimStart`+`duration` windows) plus a captions overlay track. The response is
+the updated project (with `notes` on the editorial choices). Up to 8 clips.
+Review the result, adjust, export.
+
+### Analyzing footage (single-clip clean-up)
+
+For one clip with obvious good parts (interview take, screen recording), ask
+for a clean-up analysis — and pass the brief + surroundings as `prompt` so
+even cleanup isn't blind:
 
 ```
 POST /api/assets/{id}/analyze

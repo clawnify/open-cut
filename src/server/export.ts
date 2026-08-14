@@ -227,11 +227,12 @@ function analysisPrompt(mode: string, brief?: string): string {
         ? "Propose captions only; return an empty cuts array."
         : "Propose both cuts and captions.";
   return (
-    "You are a video editor's assistant. Watch the video and propose an edit. " +
+    "You are a video editor's assistant. Watch the video and propose a CLEAN-UP edit of this " +
+    "single clip: keep the good takes, drop dead air, false starts, filler and broken moments. " +
     "Cuts: the segments worth keeping, in playback order, with millisecond start/end timestamps " +
-    "(tight in-points and out-points — trim dead air, false starts and filler). " +
+    "(tight in-points and out-points). " +
     "Captions: short on-screen lines matching the spoken content, with millisecond timing. " +
-    `${wants}${brief ? ` Editor's brief: ${brief}` : ""}`
+    `${wants}${brief ? ` Context from the editor (the clip may sit inside a larger project): ${brief}` : ""}`
   );
 }
 
@@ -319,6 +320,146 @@ export async function analyzeAsset(
     return { failure: { error: "analyze_failed", detail: "model returned unparseable output — retry" } };
   }
   return { result: { ...(parsed as AnalyzeResult), model: ANALYSIS_MODEL } };
+}
+
+/** Short-lived fetchable URL for a staged src (the platform presigns it). */
+async function presignStaged(src: string, cfg: ExportConfig): Promise<{ url: string } | { failure: ExportFailure }> {
+  const res = await fetch(`${cfg.servicesUrl || DEFAULT_SERVICES_URL}/files/presign`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ src }),
+  });
+  const json = (await res.json().catch(() => null)) as { url?: string; detail?: string } | null;
+  if (res.status !== 200 || !json?.url) {
+    return { failure: { error: "analyze_failed", detail: json?.detail ?? `could not presign staged file (${res.status})` } };
+  }
+  return { url: json.url };
+}
+
+export interface AutocutSegment {
+  clip_index: number;
+  start_ms: number;
+  end_ms: number;
+  label: string;
+  caption: string;
+}
+export interface AutocutResult {
+  sequence: AutocutSegment[];
+  notes: string;
+}
+
+const AUTOCUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["sequence", "notes"],
+  properties: {
+    sequence: {
+      type: "array",
+      description: "The finished edit: segments across all clips, in output order",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["clip_index", "start_ms", "end_ms", "label", "caption"],
+        properties: {
+          clip_index: { type: "integer", description: "0-based index into the attached clips" },
+          start_ms: { type: "integer" },
+          end_ms: { type: "integer" },
+          label: { type: "string", description: "what this segment contributes" },
+          caption: { type: "string", description: "short on-screen line for this segment, or empty" },
+        },
+      },
+    },
+    notes: { type: "string", description: "one short paragraph on the editorial choices" },
+  },
+};
+
+const AUTOCUT_MAX_CLIPS = 8;
+
+/**
+ * The whole-project cut: ONE model call watches every clip together (context
+ * is the unit of analysis — ordering and redundancy across clips can't be
+ * judged one clip at a time) and returns the sequence for the brief. Runs on
+ * the org's OpenRouter key; clips reach the model as presigned URLs.
+ */
+export async function autocutAssets(
+  assets: { id: string; name: string }[],
+  brief: string,
+  cfg: ExportConfig,
+): Promise<{ result: AutocutResult } | { failure: ExportFailure }> {
+  if (!cfg.openrouterKey) {
+    return {
+      failure: {
+        error: "analysis_unavailable",
+        detail: "no OpenRouter key available to this app — add one in the dashboard's API Keys settings",
+      },
+    };
+  }
+  if (assets.length === 0 || assets.length > AUTOCUT_MAX_CLIPS) {
+    return { failure: { error: "autocut_failed", detail: `select 1–${AUTOCUT_MAX_CLIPS} video clips` } };
+  }
+
+  const urls: string[] = [];
+  for (const a of assets) {
+    const staged = await ensureStagedSrc(a.id, cfg);
+    if ("failure" in staged) return staged;
+    const link = await presignStaged(staged.src, cfg);
+    if ("failure" in link) return link;
+    urls.push(link.url);
+  }
+
+  const clipList = assets.map((a, i) => `Clip ${i} — "${a.name}"`).join("; ");
+  const prompt =
+    `You are a video editor. The attached videos are raw clips, in this order: ${clipList}. ` +
+    `Cut them into one video, the most effective way: choose which segments to keep (millisecond ` +
+    `start/end within each clip, tight in/out points), drop dead air, false starts, filler and ` +
+    `redundancy across clips, and ORDER the segments for the strongest result — the output order ` +
+    `is your sequence array, and it does not have to follow the clip order. Give each segment an ` +
+    `optional short on-screen caption (empty string for none). Keep the total under 240 seconds ` +
+    `unless the brief demands otherwise. ` +
+    (brief ? `The video's purpose: ${brief}` : `No brief was given — aim for a tight, watchable cut.`);
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cfg.openrouterKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: ANALYSIS_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            ...urls.map((url) => ({ type: "video_url", video_url: { url } })),
+          ],
+        },
+      ],
+      max_tokens: 6000,
+      temperature: 0.3,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "autocut", strict: true, schema: AUTOCUT_SCHEMA },
+      },
+    }),
+  });
+  if (!res.ok) {
+    return { failure: { error: "autocut_failed", detail: `model call failed (${res.status}): ${(await res.text()).slice(0, 300)}` } };
+  }
+  const completion = (await res.json().catch(() => null)) as { choices?: { message?: { content?: string } }[] } | null;
+  let parsed: AutocutResult | null = null;
+  try {
+    parsed = JSON.parse(completion?.choices?.[0]?.message?.content ?? "");
+  } catch {
+    /* handled below */
+  }
+  if (!parsed || !Array.isArray(parsed.sequence) || parsed.sequence.length === 0) {
+    return { failure: { error: "autocut_failed", detail: "model returned no usable sequence — retry" } };
+  }
+  const bad = parsed.sequence.find(
+    (s) => s.clip_index < 0 || s.clip_index >= assets.length || s.end_ms <= s.start_ms,
+  );
+  if (bad) {
+    return { failure: { error: "autocut_failed", detail: "model returned an out-of-range segment — retry" } };
+  }
+  return { result: parsed };
 }
 
 /** Copy the finished MP4 into this app's storage; returns the storage key. */

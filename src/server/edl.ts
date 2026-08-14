@@ -56,6 +56,10 @@ const mainVideo = z
   .object({
     ...clipBase,
     type: z.literal("video"),
+    /** Play this many seconds from trimStart (instead of trimming the tail) —
+     *  "10s starting at 0:32" without knowing the source's length. Wins over
+     *  trimEnd when both are set. */
+    duration: seconds.min(0.05).max(MAX_OUTPUT_SECONDS).optional(),
     /** Mix this clip's own audio into the output. Default true. */
     sourceAudio: z.boolean().optional(),
     volume: z.number().finite().min(0).max(2).optional(),
