@@ -38,6 +38,8 @@ export interface Asset {
   name: string;
   content_type: string;
   size: number;
+  /** Seconds, probed client-side at upload (null for legacy/images). */
+  duration?: number | null;
 }
 
 interface MainVideo {
@@ -228,12 +230,24 @@ function useSourceDurations(edl: Edl, assets: Asset[]) {
       if (durCache.has(src)) continue;
       const a = resolve(src);
       if (!a || isImageAsset(a)) continue;
+      // Duration is data first (probed at upload); the network probe is only
+      // the fallback for legacy assets — and it backfills the row it heals.
+      if (typeof a.duration === "number" && a.duration > 0) {
+        durCache.set(src, a.duration);
+        bump((n) => n + 1);
+        continue;
+      }
       const media = document.createElement(isAudioAsset(a) ? "audio" : "video");
       media.preload = "metadata";
       media.src = assetUrl(a);
       media.onloadedmetadata = () => {
         durCache.set(src, media.duration);
         bump((n) => n + 1);
+        fetch(`/api/assets/${a.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ duration: media.duration }),
+        }).catch(() => {});
       };
     }
   }, [edl, resolve]);
@@ -772,21 +786,42 @@ function LeftPanel({
   tab: "media" | "audio" | "text";
   setTab: (t: "media" | "audio" | "text") => void;
   assets: Asset[];
-  setAssets: (a: Asset[]) => void;
+  setAssets: React.Dispatch<React.SetStateAction<Asset[]>>;
   onAdd: (a: Asset) => void;
   onAddText: () => void;
 }) {
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Read the media length from the LOCAL file — instant, no server roundtrip,
+  // immune to moov-at-end layouts that make network probing crawl.
+  const probeLocal = (file: File): Promise<number | null> =>
+    new Promise((res) => {
+      if (!/^(video|audio)\//.test(file.type)) return res(null);
+      const url = URL.createObjectURL(file);
+      const media = document.createElement(file.type.startsWith("audio/") ? "audio" : "video");
+      media.preload = "metadata";
+      media.src = url;
+      const done = (d: number | null) => {
+        URL.revokeObjectURL(url);
+        res(d);
+      };
+      media.onloadedmetadata = () => done(Number.isFinite(media.duration) ? media.duration : null);
+      media.onerror = () => done(null);
+      setTimeout(() => done(null), 10_000);
+    });
+
   const upload = async (file: File) => {
     setUploading(true);
     try {
+      const duration = await probeLocal(file);
       const form = new FormData();
       form.append("file", file);
+      if (duration) form.append("duration", String(duration));
       const r = await fetch("/api/assets", { method: "POST", body: form });
       if (!r.ok) throw new Error((await errJson(r)).error || "upload failed");
-      setAssets([(await r.json()) as Asset, ...assets]);
+      const created = (await r.json()) as Asset;
+      setAssets((prev) => [created, ...prev]);
     } finally {
       setUploading(false);
     }

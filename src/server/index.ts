@@ -4,6 +4,7 @@ import {
   initUploads,
   putUpload,
   getUpload,
+  getUploadRange,
   deleteUpload,
   makeKey,
 } from "./uploads";
@@ -131,12 +132,30 @@ app.post("/api/assets", async (c) => {
   const contentType = file.type || "application/octet-stream";
   await putUpload(key, data, contentType);
 
+  // Client-probed media length (seconds) — see schema note on assets.duration.
+  const durRaw = Number(body["duration"]);
+  const duration = Number.isFinite(durRaw) && durRaw > 0 ? durRaw : null;
+
   const res = await run(
-    "INSERT INTO assets (key, name, content_type, size) VALUES (?, ?, ?, ?)",
-    [key, file.name || key, contentType, data.byteLength],
+    "INSERT INTO assets (key, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)",
+    [key, file.name || key, contentType, data.byteLength, duration],
   );
   const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
   return c.json(row, 201);
+});
+
+// Backfill a probed duration onto a legacy asset (self-healing library).
+app.patch("/api/assets/:id", async (c) => {
+  const b = await c.req.json<{ duration?: number }>().catch(() => ({}) as { duration?: number });
+  if (typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0) {
+    await run("UPDATE assets SET duration = ? WHERE id = ? AND duration IS NULL", [
+      b.duration,
+      c.req.param("id"),
+    ]);
+  }
+  const row = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(row);
 });
 
 app.delete("/api/assets/:id", async (c) => {
@@ -175,12 +194,41 @@ app.post("/api/assets/:id/analyze", async (c) => {
   return c.json(res.result);
 });
 
-// Serve any R2 object (uploaded media + rendered videos).
+// Serve any R2 object (uploaded media + rendered videos). Range-aware: media
+// elements seek with byte ranges, and metadata probing of moov-at-end files
+// is unusably slow without 206 responses.
 app.get("/api/uploads/:key", async (c) => {
-  const obj = await getUpload(c.req.param("key"));
+  const key = c.req.param("key");
+  const range = c.req.header("Range");
+  const m = range?.match(/^bytes=(\d+)-(\d*)$/);
+
+  if (m) {
+    const start = Number(m[1]);
+    const end = m[2] ? Number(m[2]) : undefined;
+    const obj = await getUploadRange(key, start, end !== undefined ? end - start + 1 : undefined);
+    if (!obj) return c.json({ error: "Not found" }, 404);
+    const last = end !== undefined ? Math.min(end, obj.size - 1) : obj.size - 1;
+    return new Response(obj.data, {
+      status: 206,
+      headers: {
+        "Content-Type": obj.contentType,
+        "Content-Range": `bytes ${start}-${last}/${obj.size}`,
+        "Content-Length": String(last - start + 1),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000",
+      },
+    });
+  }
+
+  const obj = await getUpload(key);
   if (!obj) return c.json({ error: "Not found" }, 404);
   return new Response(obj.data, {
-    headers: { "Content-Type": obj.contentType, "Cache-Control": "public, max-age=31536000" },
+    headers: {
+      "Content-Type": obj.contentType,
+      "Content-Length": String(obj.size),
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=31536000",
+    },
   });
 });
 

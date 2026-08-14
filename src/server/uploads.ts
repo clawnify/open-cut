@@ -24,6 +24,21 @@ export async function getUpload(
   };
 }
 
+/** Byte-range read — media seeking / metadata probing need 206 responses. */
+export async function getUploadRange(
+  key: string,
+  offset: number,
+  length?: number,
+): Promise<{ data: ReadableStream; contentType: string; size: number } | null> {
+  const obj = await _bucket.get(key, { range: { offset, ...(length !== undefined ? { length } : {}) } });
+  if (!obj) return null;
+  return {
+    data: obj.body,
+    contentType: obj.httpMetadata?.contentType || "application/octet-stream",
+    size: obj.size,
+  };
+}
+
 export async function getUploadBytes(key: string): Promise<ArrayBuffer | null> {
   const obj = await _bucket.get(key);
   if (!obj) return null;

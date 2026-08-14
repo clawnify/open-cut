@@ -33,7 +33,12 @@ CREATE TABLE IF NOT EXISTS assets (
   -- Staged copies expire (~30 days); exports re-stage transparently when the
   -- pointer is missing or stale, so this is a cache, not a source of truth.
   service_key TEXT,
-  service_key_expires_at TEXT
+  service_key_expires_at TEXT,
+  -- Media length in seconds, probed client-side at upload (the browser reads
+  -- it from the local file instantly). Data, not a runtime probe — the
+  -- timeline needs it synchronously, and moov-at-end files make network
+  -- probing arbitrarily slow.
+  duration REAL
 );
 
 -- Render jobs: one row per render. The MP4 is stored in R2 and served from
