@@ -791,6 +791,7 @@ function LeftPanel({
   onAddText: () => void;
 }) {
   const [uploading, setUploading] = useState(false);
+  const [uploadErr, setUploadErr] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Read the media length from the LOCAL file — instant, no server roundtrip,
@@ -808,20 +809,36 @@ function LeftPanel({
       };
       media.onloadedmetadata = () => done(Number.isFinite(media.duration) ? media.duration : null);
       media.onerror = () => done(null);
-      setTimeout(() => done(null), 10_000);
+      setTimeout(() => done(null), 3_000);
     });
 
   const upload = async (file: File) => {
     setUploading(true);
+    setUploadErr("");
     try {
-      const duration = await probeLocal(file);
+      // Upload first — the duration probe trails behind as a PATCH so a slow
+      // probe can never delay (or appear to swallow) the upload itself.
       const form = new FormData();
       form.append("file", file);
-      if (duration) form.append("duration", String(duration));
       const r = await fetch("/api/assets", { method: "POST", body: form });
       if (!r.ok) throw new Error((await errJson(r)).error || "upload failed");
       const created = (await r.json()) as Asset;
       setAssets((prev) => [created, ...prev]);
+      probeLocal(file).then((d) => {
+        if (!d) return;
+        fetch(`/api/assets/${created.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ duration: d }),
+        })
+          .then(async (res) => {
+            const row = (await res.json()) as Asset;
+            if (row?.id) setAssets((prev) => prev.map((a) => (a.id === row.id ? row : a)));
+          })
+          .catch(() => {});
+      });
+    } catch (e) {
+      setUploadErr(`${file.name}: ${String((e as Error).message)}`);
     } finally {
       setUploading(false);
     }
@@ -876,9 +893,14 @@ function LeftPanel({
               accept={tab === "audio" ? "audio/*" : "video/*,image/*"}
               className="hidden"
               onChange={(e) => {
-                for (const f of Array.from(e.target.files ?? [])) upload(f);
+                const files = Array.from(e.target.files ?? []);
+                // Reset so re-picking the SAME file fires change again —
+                // without this, retrying an upload silently does nothing.
+                e.target.value = "";
+                for (const f of files) upload(f);
               }}
             />
+            {uploadErr && <div className="text-xs text-danger mb-2">{uploadErr}</div>}
             <div className="space-y-2">
               {list.map((a) => (
                 <button
