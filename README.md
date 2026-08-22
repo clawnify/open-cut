@@ -1,6 +1,6 @@
-<img src="readme-banner.png" alt="Open Cut preview" width="100%" />
+<img src="readme-banner.png" alt="OpenCut preview" width="100%" />
 
-# Open Cut
+# OpenCut
 
 [![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-cut)
 

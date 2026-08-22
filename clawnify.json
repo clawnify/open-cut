@@ -1,7 +1,7 @@
 {
   "$schema": "https://app.clawnify.com/schema/v1/clawnify.json",
   "version": 1,
-  "name": "Open Cut",
+  "name": "OpenCut",
   "description": "Open-source, agent-friendly video editor. Compose videos as plain HTML on a timeline, drop in your own media (logos, product demos), preview with a scrubbable playhead, and render to MP4. Powered by HyperFrames.",
   "icon": "icon.svg",
   "tags": [
@@ -17,7 +17,7 @@
     "storage": true
   },
   "deploy": {
-    "title": "Deploy your Open Cut studio",
+    "title": "Deploy your OpenCut studio",
     "subtitle": "Compose videos as HTML on a timeline, drop in your logo and product demos, and render to MP4.",
     "prompts": [
       {
