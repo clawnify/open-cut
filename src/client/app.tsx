@@ -140,7 +140,7 @@ export function App() {
         ) : (
           <Film className="w-5 h-5 text-primary" />
         )}
-        <span className="font-semibold">Open Cut</span>
+        <span className="font-semibold">OpenCut</span>
         <span className="text-faint text-sm ml-1">edit & render video</span>
       </header>
 

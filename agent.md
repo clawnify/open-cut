@@ -1,4 +1,4 @@
-# HyperFrames Studio — agent guide
+# OpenCut — agent guide
 
 This app turns **HTML compositions into MP4 videos** using HeyGen HyperFrames.
 You author compositions as plain HTML, the user drops in media (logos, product
