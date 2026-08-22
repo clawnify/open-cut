@@ -2,7 +2,7 @@
 
 # OpenCut
 
-[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/open-cut)
+[![Deploy with Clawnify](https://app.clawnify.com/deploy-button.svg)](https://app.clawnify.com/deploy?repo=clawnify/OpenCut)
 
 An open-source, **agent-friendly video editor**. Compose videos as plain **HTML on a timeline**, drop in your own media (logos, product demos), preview with a scrubbable playhead, and render to **MP4**.
 
